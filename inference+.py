@@ -74,9 +74,6 @@ def parse_arguments():
                         help="Whether to save the video using the index or prompt as the filename")
     parser.add_argument("--no_video", action="store_true", help="Don't save video files, only frames")
     
-    # Distributed training
-    parser.add_argument("--local_rank", type=int, default=0, help="Local rank for distributed inference")
-    
     return parser.parse_args()
 
 
@@ -167,9 +164,14 @@ def setup_models(args, device):
     transformer = WanDiffusionWrapper(is_causal=True)
     if args.checkpoint_path:
         state_dict = torch.load(args.checkpoint_path, map_location="cpu")
-        #transformer.load_state_dict(state_dict['generator_ema' if args.use_ema else 'generator'])
-        transformer.load_state_dict(state_dict['generator_ema'])
-    
+        model_key = 'generator_ema' if args.use_ema else 'generator'
+        try:
+            transformer.load_state_dict(state_dict[model_key])
+            print(f"✅ Loaded {model_key} from checkpoint")
+        except KeyError:
+            print(f"❌ Key '{model_key}' not found in checkpoint, trying 'generator_ema'")
+            transformer.load_state_dict(state_dict['generator_ema'])
+
     text_encoder.eval()
     transformer.eval()
     transformer.to(dtype=torch.float16)
@@ -254,21 +256,24 @@ def calculate_sha256(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def create_output_name(prompt, seed, idx=None):
+def create_output_name(prompt, seed, idx=None, save_with_index=False):
     """Create a unique output name based on prompt and seed."""
-    # Extract words up to the first punctuation or newline
-    words_up_to_punctuation = re.split(r'[^\w\s]', prompt)[0].strip() if prompt else ''
-    if not words_up_to_punctuation:
-        words_up_to_punctuation = re.split(r'[\n\r]', prompt)[0].strip()
-    
-    # Calculate SHA-256 hash of the entire prompt
-    sha256_hash = calculate_sha256(prompt)
-    
-    # Create name with the extracted words and hash
-    if idx is not None:
-        return f"{idx:04d}_{words_up_to_punctuation[:20]}_{seed}_{sha256_hash[:10]}"
+    if save_with_index and idx is not None:
+        return f"{idx:04d}_{seed}"
     else:
-        return f"{words_up_to_punctuation[:20]}_{seed}_{sha256_hash[:10]}"
+        # Extract words up to the first punctuation or newline
+        words_up_to_punctuation = re.split(r'[^\w\s]', prompt)[0].strip() if prompt else ''
+        if not words_up_to_punctuation:
+            words_up_to_punctuation = re.split(r'[\n\r]', prompt)[0].strip()
+    
+        # Calculate SHA-256 hash of the entire prompt
+        sha256_hash = calculate_sha256(prompt)
+    
+        # Create name with the extracted words and hash
+        if idx is not None:
+            return f"{idx:04d}_{words_up_to_punctuation[:20]}_{seed}_{sha256_hash[:10]}"
+        else:
+            return f"{words_up_to_punctuation[:20]}_{seed}_{sha256_hash[:10]}"
 
 
 @torch.no_grad()
@@ -280,7 +285,7 @@ def generate_video_advanced(pipeline, args, prompt, seed, idx=None, low_memory=F
     generation_start_time = time.time()
     
     # Create output name
-    output_name = create_output_name(prompt, seed, idx)
+    output_name = create_output_name(prompt, seed, idx, args.save_with_index)
     
     # Setup output directories
     if args.save_frames:
@@ -305,7 +310,7 @@ def generate_video_advanced(pipeline, args, prompt, seed, idx=None, low_memory=F
     pipeline._initialize_kv_cache(batch_size=1, dtype=torch.float16, device=device)
     pipeline._initialize_crossattn_cache(batch_size=1, dtype=torch.float16, device=device)
     
-    noise = torch.randn([1, 21, 16, 60, 104], device=device, dtype=torch.float16, generator=rnd)
+    noise = torch.randn([1, args.num_output_frames, 16, 60, 104], device=device, dtype=torch.float16, generator=rnd)
     
     # Generation parameters
     num_blocks = 7
