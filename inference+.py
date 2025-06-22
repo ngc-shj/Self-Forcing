@@ -277,7 +277,8 @@ def create_output_name(prompt, seed, idx=None, save_with_index=False):
 
 
 @torch.no_grad()
-def generate_video_advanced(pipeline, args, prompt, seed, idx=None, low_memory=False):
+def generate_video_advanced(pipeline, args, prompt, seed, idx=None, low_memory=False, initial_image=None):
+
     """Advanced video generation with frame saving and multiple options."""
     device = pipeline.device if hasattr(pipeline, 'device') else gpu
     
@@ -310,8 +311,50 @@ def generate_video_advanced(pipeline, args, prompt, seed, idx=None, low_memory=F
     pipeline._initialize_kv_cache(batch_size=1, dtype=torch.float16, device=device)
     pipeline._initialize_crossattn_cache(batch_size=1, dtype=torch.float16, device=device)
     
-    noise = torch.randn([1, args.num_output_frames, 16, 60, 104], device=device, dtype=torch.float16, generator=rnd)
-    
+    # I2V vs T2V noise generation
+    if initial_image is not None:
+        # I2V: Encode initial image and generate noise for remaining frames
+        print("🖼️ I2V mode: Processing initial image...")
+        
+        # Preprocess image
+        if hasattr(initial_image, 'unsqueeze'):
+            # Already a tensor
+            image_tensor = initial_image.squeeze(0).unsqueeze(0).unsqueeze(2).to(device=device, dtype=torch.float16)
+        else:
+            # PIL Image - apply transforms
+            from torchvision import transforms
+            transform = transforms.Compose([
+                transforms.Resize((480, 832)),
+                transforms.ToTensor(), 
+                transforms.Normalize([0.5], [0.5])
+            ])
+            image_tensor = transform(initial_image).unsqueeze(0).unsqueeze(2).to(device=device, dtype=torch.float16)
+        
+        # VAE encode initial image
+        try:
+            if hasattr(pipeline.vae, 'encode_to_latent'):
+                initial_latent = pipeline.vae.encode_to_latent(image_tensor).to(device=device, dtype=torch.float16)
+            else:
+                # Fallback: use noise for first frame if VAE encoder unavailable
+                print("⚠️ VAE encoder not available, using noise for initial frame")
+                initial_latent = torch.randn([1, 1, 16, 60, 104], device=device, dtype=torch.float16, generator=rnd)
+        except Exception as e:
+            print(f"⚠️ VAE encoding failed: {e}, using noise for initial frame")
+            initial_latent = torch.randn([1, 1, 16, 60, 104], device=device, dtype=torch.float16, generator=rnd)
+        
+        # Generate noise for remaining frames (num_output_frames - 1)
+        remaining_noise = torch.randn([1, args.num_output_frames - 1, 16, 60, 104], 
+                                     device=device, dtype=torch.float16, generator=rnd)
+        
+        # Concatenate initial latent with remaining noise
+        noise = torch.cat([initial_latent, remaining_noise], dim=1)
+        print(f"🎬 I2V noise shape: {noise.shape} (first frame from image)")
+    else:
+        # T2V: Generate noise for all frames
+        noise = torch.randn([1, args.num_output_frames, 16, 60, 104], 
+                           device=device, dtype=torch.float16, generator=rnd)
+        print(f"🎬 T2V noise shape: {noise.shape} (all frames from noise)")
+
     # Generation parameters
     num_blocks = 7
     current_start_frame = 0
@@ -463,15 +506,21 @@ def main():
     
     # Single prompt generation
     if args.prompt:
-        print(f"🎯 Single prompt generation mode")
+        if args.i2v:
+            print("❌ Error: --prompt option is not compatible with --i2v mode")
+            print("💡 Use --data_path with TextImagePairDataset for I2V generation")
+            return
+        
+        print(f"🎯 Single prompt generation mode (T2V)")
         for sample_idx in range(args.num_samples):
             current_seed = args.seed + sample_idx
             video, output_name, gen_time = generate_video_advanced(
-                pipeline, args, args.prompt, current_seed, low_memory=low_memory
+                pipeline, args, args.prompt, current_seed, 
+                low_memory=low_memory, initial_image=None
             )
             print(f"✅ Sample {sample_idx+1}/{args.num_samples} completed: {output_name}")
         return
-    
+
     # Batch processing from dataset
     if not args.data_path:
         print("❌ Error: Either --prompt or --data_path must be provided")
@@ -507,24 +556,40 @@ def main():
     # Process batches
     for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0), desc="Processing prompts"):
         idx = batch_data['idx'].item()
-        prompt = batch_data['prompts'][0]
+        
+        # Get prompt (handle different dataset formats)
+        if isinstance(batch_data['prompts'], list):
+            prompt = batch_data['prompts'][0]
+        else:
+            prompt = batch_data['prompts']
         
         if idx >= num_prompts:
             continue
         
         print(f"\n📝 Processing prompt {idx}: {prompt[:100]}...")
         
+        # Get initial image for I2V mode
+        initial_image = None
+        if args.i2v and 'image' in batch_data:
+            initial_image = batch_data['image']
+            if hasattr(initial_image, 'squeeze'):
+                initial_image = initial_image.squeeze(0)  # Remove batch dimension
+            print(f"🖼️ I2V mode: Got initial image with shape {initial_image.shape if hasattr(initial_image, 'shape') else type(initial_image)}")
+        
         for sample_idx in range(args.num_samples):
             current_seed = args.seed + idx * args.num_samples + sample_idx
             
             try:
                 video, output_name, gen_time = generate_video_advanced(
-                    pipeline, args, prompt, current_seed, idx=idx, low_memory=low_memory
+                    pipeline, args, prompt, current_seed, 
+                    idx=idx, low_memory=low_memory, 
+                    initial_image=initial_image
                 )
                 print(f"✅ Completed {output_name} in {gen_time:.2f}s")
             except Exception as e:
                 print(f"❌ Failed to generate video for prompt {idx}: {e}")
-                continue
+                import traceback
+                traceback.print_exc()
     
     print("🎊 All generations completed!")
 
